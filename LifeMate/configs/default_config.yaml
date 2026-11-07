@@ -1,0 +1,63 @@
+# ==============================================================================
+# CẤU HÌNH CHUẨN: STATE-GROUNDED POMDP 3-STAGE PIPELINE
+# Thống nhất 100% với Problem Formulation, Input/Output và 3 Contributions
+# Ràng buộc: Tổng tham số < 6B (ASR 0.24B + SLM 3.09B = 3.33B), Context <= 16K, <= 30s/sample
+# ==============================================================================
+
+experiment:
+  name: "pomdp_full_proposed_pipeline"
+  seed: 42
+  max_time_per_sample_sec: 28.0
+  save_Pomdp_traces: true
+  trace_output_dir: "outputs/traces"
+
+# STAGE 1: MULTIMODAL PERCEPTION, DYNAMIC SCHEMA PRUNING & APP-OVERLAP RAG
+# (Contribution 2 & Contribution 3)
+stage1_perception_and_grounding:
+  asr:
+    use_oracle_transcript: false          # Đặt true khi chạy Ablation Topline (SLUE/SpokenWOZ protocol)
+    model_name_or_path: "vinai/PhoWhisper-small"
+    device: "cuda"
+    torch_dtype: "float16"
+    sample_rate: 16000
+    beam_size: 1                          # Greedy decoding (Reproducibility)
+    code_switching_normalization: true
+    lexicon_map:
+      "ây xi": "AC"
+      "búc": "book"
+      "in bóc": "inbox"
+      "mêo": "email"
+      "ờ cao": "account"
+      "wi fi": "wifi"
+      "pát guốt": "password"
+  schema_pruning:
+    enabled: true                         # Contribution 2: Dynamic Schema Pruning S(K)
+    include_constraint_tags: true         # Giữ nguyên siêu dữ liệu x-ref, x-one-of, x-match: fuzzy
+  few_shot_rag:
+    enabled: true                         # Contribution 3: App-Overlap Few-Shot RAG
+    index_path: "outputs/indices/bm25_trajectories.pkl"
+    top_k: 3
+    app_overlap_boost: 1.35               # Trọng số thưởng khi mẫu train có cùng installed_apps K
+
+# STAGE 2: CONSTRAINED POMDP POLICY PLANNER (SLM < 5B)
+# Không gian hành động A = {Call(tool, theta), AskMissing(tool, params), EmptySet}
+stage2_pomdp_planner:
+  llm:
+    base_model_path: "Qwen/Qwen2.5-3B-Instruct"
+    lora_adapter_path: "outputs/checkpoints/qwen25_3b_pomdp_lora"
+    device: "cuda"
+    torch_dtype: "bfloat16"
+    max_context_length: 16384
+    max_new_tokens: 512
+    do_sample: false                      # Deterministic decoding (temperature = 0)
+    temperature: 0.0
+  system_prompt_path: "configs/prompts/pomdp_policy_prompt.txt"
+  enforce_xref_read_before_write: true    # Kiểm tra logic gọi tool read trước khi truyền ID vào x-ref
+
+# STAGE 3: VALIDATE-BEFORE-CALL SELF-CORRECTION & ENVIRONMENT EXECUTION
+# (Contribution 1: Bảo vệ Precision P = M / (M + U) và State Hash)
+stage3_closed_loop_executor:
+  max_pomdp_steps: 6
+  validate_before_call: true              # Contribution 1: Lọc qua env.validate() trước khi gọi env.call()
+  max_self_correction_retries: 2          # Số lần LLM tự sửa lỗi schema tại mỗi bước k mà không làm tăng U
+  auto_ask_missing_on_schema_error: true  # Chuyển sang sys.ask_missing_info nếu lỗi thiếu required/x-one-of không thể tự sửa

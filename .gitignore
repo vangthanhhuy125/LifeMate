@@ -1,0 +1,22 @@
+# Python 
+__pycache__/ 
+*.py[cod] 
+*$py.class 
+ 
+# Virtual environments 
+venv/ 
+.venv/ 
+ 
+data/ 
+outputs/ 
+result/ 
+*.pkl 
+*.bin 
+*.pt 
+*.pth 
+*.safetensors 
+ 
+# IDE / OS 
+.idea/ 
+.vscode/ 
+.DS_Store 

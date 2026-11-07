@@ -1,0 +1,29 @@
+# Ablation 1: Tắt cơ chế Validate-Before-Call Self-Correction (Contribution 1)
+# Dùng để chứng minh U (unmatched/schema-error calls) tăng vọt làm giảm Precision P = M / (M + U)
+experiment:
+  name: "ablation_wo_validate_before_call"
+  seed: 42
+  max_time_per_sample_sec: 28.0
+
+stage1_perception_and_grounding:
+  asr:
+    use_oracle_transcript: false
+    model_name_or_path: "vinai/PhoWhisper-small"
+    code_switching_normalization: true
+  schema_pruning:
+    enabled: true
+  few_shot_rag:
+    enabled: true
+    top_k: 3
+
+stage2_pomdp_planner:
+  llm:
+    base_model_path: "Qwen/Qwen2.5-3B-Instruct"
+    lora_adapter_path: "outputs/checkpoints/qwen25_3b_pomdp_lora"
+    do_sample: false
+    temperature: 0.0
+
+stage3_closed_loop_executor:
+  max_pomdp_steps: 6
+  validate_before_call: false             # TẮT màng lọc env.validate -> Gọi thẳng env.call
+  max_self_correction_retries: 0
