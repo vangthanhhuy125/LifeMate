@@ -1,2 +1,5 @@
-experiment:
-  name: 'ablation_no_xref_guard'
+extends: "configs/default_config.yaml"
+experiment_name: "no_xref_guard"
+execution:
+  enable_xref_guard: false
+  enforce_read_before_write_xref: false

@@ -1,207 +1,318 @@
-import unittest
-from src.utils.seed import set_seed
-from src.modules.schema_pruner import DynamicSchemaPruner
-from src.modules.retriever_bm25 import AppOverlapRetriever
-from src.modules.nlu_normalizers import TimeNormalizer, EntityResolver
-from src.modules.validator_guard import ValidatorGuard
-from src.evaluation.official_scorer import OfficialScorer
-from src.utils.token_budget import enforce_token_budget
-from tests.fakes.fake_env import FakeToolEnv
+"""Realistic simulation of the organisers' `zaic_tools.ToolEnv` for self-contained testing."""
 
-class TestLifeMateFramework(unittest.TestCase):
+import copy
+import hashlib
+import json
+import unicodedata
+from typing import Any, Dict, List, Optional
 
-    def test_01_scorer_exact_match(self):
-        s = OfficialScorer.score([{"name":"a", "arguments":{"k":1}}], [{"name":"a", "arguments":{"k":1}}], "h", "h")
-        self.assertAlmostEqual(s, 1.0)
 
-    def test_02_scorer_wrong_hash(self):
-        s = OfficialScorer.score([{"name":"a", "arguments":{"k":1}}], [{"name":"a", "arguments":{"k":1}}], "h1", "h2")
-        self.assertEqual(s, 0.0)
+def build_sample_catalog() -> Dict[str, Any]:
+    """Build a representative `<split>_tools_catalog.json` dictionary for testing."""
+    return {
+        "schema_version": "2.7.0",
+        "apps": [
+            {
+                "id": "smart_home",
+                "name_vi": "Nhà thông minh",
+                "group": "home",
+                "description": "Điều khiển thiết bị thông minh trong nhà",
+                "tools": [
+                    {
+                        "name": "smart_home.get_status",
+                        "kind": "read",
+                        "description": "Lấy danh sách và trạng thái các thiết bị trong nhà",
+                        "parameters": {"type": "object", "properties": {}, "required": []},
+                        "returns": "devices list",
+                        "app": "smart_home",
+                    },
+                    {
+                        "name": "smart_home.climate_set",
+                        "kind": "write",
+                        "description": "Bật và chỉnh nhiệt độ điều hòa",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "device_id": {
+                                    "type": "string",
+                                    "description": "ID điều hòa lấy từ smart_home.get_status",
+                                    "x-ref": "smart_home.devices",
+                                },
+                                "mode": {"type": "string", "enum": ["cool", "dry", "fan", "off"]},
+                                "temperature": {"type": "integer"},
+                            },
+                            "required": ["device_id", "mode", "temperature"],
+                        },
+                        "returns": "",
+                        "app": "smart_home",
+                    },
+                    {
+                        "name": "smart_home.light_set",
+                        "kind": "write",
+                        "description": "Bật/tắt/chỉnh sáng đèn",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "device_id": {
+                                    "type": "string",
+                                    "description": "ID thiết bị lấy từ smart_home.get_status",
+                                    "x-ref": "smart_home.devices",
+                                },
+                                "power": {"type": "string", "enum": ["on", "off"]},
+                                "brightness": {"type": "integer"},
+                            },
+                            "required": ["device_id", "power"],
+                        },
+                        "returns": "",
+                        "app": "smart_home",
+                    },
+                ],
+            },
+            {
+                "id": "ride",
+                "name_vi": "Gọi xe",
+                "group": "transport",
+                "description": "Đặt xe di chuyển",
+                "tools": [
+                    {
+                        "name": "ride.book",
+                        "kind": "write",
+                        "description": "Đặt chuyến xe từ điểm đón đến điểm đến",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "from": {"type": "string", "x-match": "fuzzy"},
+                                "to": {"type": "string", "x-match": "fuzzy"},
+                            },
+                            "required": ["from", "to"],
+                        },
+                        "returns": "ride booking details",
+                        "app": "ride",
+                    }
+                ],
+            },
+            {
+                "id": "alarm",
+                "name_vi": "Báo thức",
+                "group": "utility",
+                "description": "Quản lý báo thức",
+                "tools": [
+                    {
+                        "name": "alarm.list",
+                        "kind": "read",
+                        "description": "Xem danh sách báo thức hiện tại",
+                        "parameters": {"type": "object", "properties": {}, "required": []},
+                        "returns": "alarms",
+                        "app": "alarm",
+                    },
+                    {
+                        "name": "alarm.create",
+                        "kind": "write",
+                        "description": "Tạo báo thức mới",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "time": {"type": "string", "description": "Thời gian ISO 8601"},
+                                "label": {"type": "string", "x-match": "fuzzy"},
+                            },
+                            "required": ["time"],
+                        },
+                        "returns": "",
+                        "app": "alarm",
+                    },
+                ],
+            },
+            {
+                "id": "music",
+                "name_vi": "Âm nhạc",
+                "group": "media",
+                "description": "Nghe nhạc và quản lý playlist",
+                "tools": [
+                    {
+                        "name": "music.add_to_playlist",
+                        "kind": "write",
+                        "description": "Thêm bài hát vào danh sách phát",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "playlist_id": {"type": "string"},
+                                "track_id": {"type": "string"},
+                            },
+                            "required": ["playlist_id", "track_id"],
+                        },
+                        "returns": "",
+                        "app": "music",
+                    }
+                ],
+            },
+        ],
+    }
 
-    def test_03_scorer_fuzzy_match(self):
-        s = OfficialScorer.score([{"name":"a", "arguments":{"k":"màu vàng ấm"}}], [{"name":"a", "arguments":{"k":"vàng ấm"}}], "h", "h", ["k"])
-        self.assertTrue(s > 0.0)
 
-    def test_04_scorer_out_of_scope_success(self):
-        s = OfficialScorer.score([], [], "h", "h")
-        self.assertEqual(s, 1.0)
+class FakeToolEnv:
+    """Drop-in replacement for `zaic_tools.ToolEnv` during unit & pipeline testing."""
 
-    def test_05_schema_pruning_includes_sys(self):
-        cat = {"apps": [{"id": "app1", "tools": [{"name": "t1"}]}]}
-        p, _ = DynamicSchemaPruner.prune(cat, {"app1": {}})
-        names = [x["name"] for x in p]
-        self.assertIn("sys.ask_missing_info", names)
+    def __init__(
+        self,
+        split: str,
+        sample_id: str,
+        root: str = ".",
+        initial_state: Optional[Dict[str, Any]] = None,
+        catalog: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.split = split
+        self.sample_id = sample_id
+        self.root = root
+        self.catalog = catalog or build_sample_catalog()
+        self._tool_schemas: Dict[str, Dict[str, Any]] = {}
+        self._fuzzy_fields: Dict[str, List[str]] = {}
+        self._index_catalog()
 
-    def test_06_schema_pruning_excludes_uninstalled(self):
-        cat = {"apps": [{"id": "app1", "tools": [{"name": "t1"}]}]}
-        p, _ = DynamicSchemaPruner.prune(cat, {})
-        names = [x["name"] for x in p]
-        self.assertNotIn("t1", names)
+        self._state: Dict[str, Any] = copy.deepcopy(
+            initial_state
+            if initial_state is not None
+            else {
+                "smart_home": {
+                    "devices": [
+                        {
+                            "id": "ac_living_room",
+                            "name": "điều hòa phòng khách",
+                            "type": "ac",
+                            "room": "phòng khách",
+                            "floor": 1,
+                            "state": {"mode": "off", "temperature": 28},
+                        },
+                        {
+                            "id": "light_living_1",
+                            "name": "đèn phòng khách",
+                            "type": "light",
+                            "room": "phòng khách",
+                            "floor": 1,
+                            "state": {"power": "on", "brightness": 80},
+                        },
+                    ]
+                },
+                "ride": {"bookings": []},
+                "alarm": {"alarms": []},
+                "asked_missing": [],
+            }
+        )
+        self._call_log: List[Dict[str, Any]] = []
 
-    def test_07_validator_guard_xref_fail(self):
-        ok, err = ValidatorGuard.check_xref("t", {"device_id": "123"}, [])
-        self.assertFalse(ok)
+    def _index_catalog(self) -> None:
+        for app in self.catalog.get("apps", []):
+            for tool in app.get("tools", []):
+                t_name = tool["name"]
+                self._tool_schemas[t_name] = tool
+                props = (tool.get("parameters") or {}).get("properties") or {}
+                for p_name, p_def in props.items():
+                    if isinstance(p_def, dict) and p_def.get("x-match") == "fuzzy":
+                        self._fuzzy_fields.setdefault(t_name, []).append(p_name)
 
-    def test_08_validator_guard_xref_pass(self):
-        ok, err = ValidatorGuard.check_xref("t", {"device_id": "123"}, [{"observation": {"devices": [{"id": "123"}]}}])
-        self.assertTrue(ok)
+        self._tool_schemas["sys.ask_missing_info"] = {
+            "name": "sys.ask_missing_info",
+            "kind": "meta",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tool_name": {"type": "string"},
+                    "params": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["tool_name", "params"],
+            },
+        }
 
-    def test_09_time_normalizer(self):
-        res = TimeNormalizer.normalize("mai", "2026-10-26")
-        self.assertEqual(res, "2026-10-26+1day")
+    def validate(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate tool existence and argument schema without mutating state or logging."""
+        if tool_name not in self._tool_schemas:
+            return {"ok": False, "error": f"công cụ không tồn tại: {tool_name}"}
+        if not isinstance(arguments, dict):
+            return {"ok": False, "error": "arguments phải là object"}
 
-    def test_10_entity_resolver(self):
-        res = EntityResolver.resolve("điều hòa", [{"devices": [{"id": "ac_1", "name": "Điều hòa"}]}])
-        self.assertEqual(res, "ac_1")
+        schema = self._tool_schemas[tool_name].get("parameters") or {}
+        required = schema.get("required") or []
+        props = schema.get("properties") or {}
 
-    def test_11_token_budget(self):
-        res = enforce_token_budget("a" * 100000, max_tokens=10)
-        self.assertTrue(len(res) < 100000)
+        for req in required:
+            if req not in arguments or arguments[req] is None or arguments[req] == "":
+                return {"ok": False, "error": f"thiếu tham số bắt buộc: {req}"}
 
-    def test_12_fake_env_validate(self):
-        env = FakeToolEnv("test", "id", "/")
-        self.assertFalse(env.validate("t", {"k": "fail"})["ok"])
+        for k, v in arguments.items():
+            if k not in props:
+                return {"ok": False, "error": f"tham số không hợp lệ: {k}"}
+            p_def = props[k]
+            expected_type = p_def.get("type")
+            if expected_type == "integer" and not isinstance(v, int):
+                return {"ok": False, "error": f"sai kiểu dữ liệu cho {k}: cần integer"}
+            if expected_type == "string" and not isinstance(v, str):
+                return {"ok": False, "error": f"sai kiểu dữ liệu cho {k}: cần string"}
+            if "enum" in p_def and v not in p_def["enum"]:
+                return {"ok": False, "error": f"giá trị {v} không thuộc enum {p_def['enum']}"}
 
-    def test_13_generic(self):
-        self.assertTrue(True)
+        return {"ok": True}
 
-    def test_14_generic(self):
-        self.assertTrue(True)
+    def call(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute a tool call, log it unconditionally, update internal state, and return result."""
+        norm_args = copy.deepcopy(arguments) if isinstance(arguments, dict) else {}
+        self._call_log.append({"name": tool_name, "arguments": norm_args})
 
-    def test_15_generic(self):
-        self.assertTrue(True)
+        val = self.validate(tool_name, norm_args)
+        if not val["ok"]:
+            return val
 
-    def test_16_generic(self):
-        self.assertTrue(True)
+        if tool_name == "smart_home.get_status":
+            return {"ok": True, "devices": copy.deepcopy(self._state["smart_home"]["devices"])}
 
-    def test_17_generic(self):
-        self.assertTrue(True)
+        if tool_name == "smart_home.climate_set":
+            dev_id = norm_args["device_id"]
+            for dev in self._state["smart_home"]["devices"]:
+                if dev["id"] == dev_id:
+                    dev["state"]["mode"] = norm_args["mode"]
+                    dev["state"]["temperature"] = norm_args["temperature"]
+                    return {"ok": True, "device": copy.deepcopy(dev)}
+            return {"ok": False, "error": f"không tìm thấy thiết bị: {dev_id}"}
 
-    def test_18_generic(self):
-        self.assertTrue(True)
+        if tool_name == "smart_home.light_set":
+            dev_id = norm_args["device_id"]
+            for dev in self._state["smart_home"]["devices"]:
+                if dev["id"] == dev_id:
+                    dev["state"]["power"] = norm_args["power"]
+                    if "brightness" in norm_args:
+                        dev["state"]["brightness"] = norm_args["brightness"]
+                    return {"ok": True, "device": copy.deepcopy(dev)}
+            return {"ok": False, "error": f"không tìm thấy thiết bị: {dev_id}"}
 
-    def test_19_generic(self):
-        self.assertTrue(True)
+        if tool_name == "ride.book":
+            booking = {"status": "booked", "has_route": bool(norm_args.get("from") and norm_args.get("to"))}
+            self._state["ride"]["bookings"].append(booking)
+            return {"ok": True, "booking_id": "ride_01"}
 
-    def test_20_generic(self):
-        self.assertTrue(True)
+        if tool_name == "alarm.list":
+            return {"ok": True, "alarms": copy.deepcopy(self._state["alarm"]["alarms"])}
 
-    def test_21_generic(self):
-        self.assertTrue(True)
+        if tool_name == "alarm.create":
+            alarm_obj = {"time": norm_args["time"]}
+            self._state["alarm"]["alarms"].append(alarm_obj)
+            return {"ok": True, "alarm": alarm_obj}
 
-    def test_22_generic(self):
-        self.assertTrue(True)
+        if tool_name == "sys.ask_missing_info":
+            self._state["asked_missing"].append(
+                {
+                    "tool_name": norm_args["tool_name"],
+                    "params": sorted(norm_args["params"]),
+                }
+            )
+            return {"ok": True}
 
-    def test_23_generic(self):
-        self.assertTrue(True)
+        return {"ok": True}
 
-    def test_24_generic(self):
-        self.assertTrue(True)
+    def get_tool_calls(self) -> List[Dict[str, Any]]:
+        """Return ordered list of all tool calls made on this environment."""
+        return copy.deepcopy(self._call_log)
 
-    def test_25_generic(self):
-        self.assertTrue(True)
-
-    def test_26_generic(self):
-        self.assertTrue(True)
-
-    def test_27_generic(self):
-        self.assertTrue(True)
-
-    def test_28_generic(self):
-        self.assertTrue(True)
-
-    def test_29_generic(self):
-        self.assertTrue(True)
-
-    def test_30_generic(self):
-        self.assertTrue(True)
-
-    def test_31_generic(self):
-        self.assertTrue(True)
-
-    def test_32_generic(self):
-        self.assertTrue(True)
-
-    def test_33_generic(self):
-        self.assertTrue(True)
-
-    def test_34_generic(self):
-        self.assertTrue(True)
-
-    def test_35_generic(self):
-        self.assertTrue(True)
-
-    def test_36_generic(self):
-        self.assertTrue(True)
-
-    def test_37_generic(self):
-        self.assertTrue(True)
-
-    def test_38_generic(self):
-        self.assertTrue(True)
-
-    def test_39_generic(self):
-        self.assertTrue(True)
-
-    def test_40_generic(self):
-        self.assertTrue(True)
-
-    def test_41_generic(self):
-        self.assertTrue(True)
-
-    def test_42_generic(self):
-        self.assertTrue(True)
-
-    def test_43_generic(self):
-        self.assertTrue(True)
-
-    def test_44_generic(self):
-        self.assertTrue(True)
-
-    def test_45_generic(self):
-        self.assertTrue(True)
-
-    def test_46_generic(self):
-        self.assertTrue(True)
-
-    def test_47_generic(self):
-        self.assertTrue(True)
-
-    def test_48_generic(self):
-        self.assertTrue(True)
-
-    def test_49_generic(self):
-        self.assertTrue(True)
-
-    def test_50_generic(self):
-        self.assertTrue(True)
-
-    def test_51_generic(self):
-        self.assertTrue(True)
-
-    def test_52_generic(self):
-        self.assertTrue(True)
-
-    def test_53_generic(self):
-        self.assertTrue(True)
-
-    def test_54_generic(self):
-        self.assertTrue(True)
-
-    def test_55_generic(self):
-        self.assertTrue(True)
-
-    def test_56_generic(self):
-        self.assertTrue(True)
-
-    def test_57_generic(self):
-        self.assertTrue(True)
-
-    def test_58_generic(self):
-        self.assertTrue(True)
-
-    def test_59_generic(self):
-        self.assertTrue(True)
-
-    def test_60_generic(self):
-        self.assertTrue(True)
+    def get_state_hash(self) -> str:
+        """Compute deterministic 16-char hex digest of the final app state (excluding fuzzy text)."""
+        canonical = unicodedata.normalize(
+            "NFC", json.dumps(self._state, sort_keys=True, ensure_ascii=False)
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]

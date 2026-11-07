@@ -1,2 +1,4 @@
-experiment:
-  name: 'ablation_oracle_asr'
+extends: "configs/default_config.yaml"
+experiment_name: "oracle_asr"
+asr:
+  use_oracle_transcript_if_available: true

@@ -1,114 +1,88 @@
-import json
-import math
-import pickle
-import re
-from collections import Counter
+"""Hybrid BM25 + Installed App Overlap Retriever for Few-Shot POMDP Trajectory Grounding."""
+
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import Any, Dict, List, Optional, Set
 
-class NativeBM25Okapi:
-    """Hiện thực hóa thuật toán Okapi BM25 độc lập, không phụ thuộc thư viện ngoài."""
-    def __init__(self, tokenized_corpus: List[List[str]], k1: float = 1.5, b: float = 0.75):
-        self.k1 = k1
-        self.b = b
-        self.corpus_size = len(tokenized_corpus)
-        self.doc_len = [len(doc) for doc in tokenized_corpus]
-        self.avgdl = sum(self.doc_len) / self.corpus_size if self.corpus_size > 0 else 0.0
-        self.doc_freqs = []
-        self.idf = {}
-        df = {}
-        for doc in tokenized_corpus:
-            frequencies = Counter(doc)
-            self.doc_freqs.append(frequencies)
-            for token in frequencies.keys():
-                df[token] = df.get(token, 0) + 1
-        for token, freq in df.items():
-            self.idf[token] = math.log(1.0 + (self.corpus_size - freq + 0.5) / (freq + 0.5))
+from src.modules.retriever_bm25 import RetrieverBM25
 
-    def get_scores(self, query_tokens: List[str]) -> List[float]:
-        scores = [0.0] * self.corpus_size
-        for q in query_tokens:
-            if q not in self.idf:
-                continue
-            q_idf = self.idf[q]
-            for idx, doc_freq in enumerate(self.doc_freqs):
-                tf = doc_freq.get(q, 0)
-                if tf > 0:
-                    denom = tf + self.k1 * (1.0 - self.b + self.b * self.doc_len[idx] / (self.avgdl + 1e-8))
-                    scores[idx] += q_idf * (tf * (self.k1 + 1.0)) / denom
-        return scores
 
-class AppOverlapTrajectoryRetriever:
-    """
-    [Contribution 3 - Grounding đa phương thức qua Few-Shot RAG nội bộ]:
-    Truy xuất quỹ đạo mẫu (trajectories) từ tập huấn luyện kết hợp điểm BM25 ngữ nghĩa
-    và hệ số tương đồng tập ứng dụng khả dụng (App-Overlap Weighting).
-    """
-    def __init__(self, top_k: int = 3, app_overlap_boost: float = 1.35):
-        self.top_k = top_k
-        self.app_overlap_boost = app_overlap_boost
-        self.records: List[Dict[str, Any]] = []
-        self.bm25 = None
+class AppOverlapRetriever:
+    """Combines lexical BM25 similarity with Jaccard app-overlap to select few-shot trajectories."""
+
+    def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
+        self.config = config or {}
+        ret_cfg = self.config.get("retrieval", self.config)
+        self.enable_rag = bool(ret_cfg.get("enable_rag", True))
+        self.index_path = str(ret_cfg.get("index_path", "artifacts/rag_trajectories.json"))
+        self.top_k = int(ret_cfg.get("top_k", 2))
+        self.bm25_weight = float(ret_cfg.get("bm25_weight", 0.55))
+        self.app_overlap_weight = float(ret_cfg.get("app_overlap_weight", 0.45))
+        self.min_threshold = float(ret_cfg.get("min_similarity_threshold", 0.15))
+
+        self.bm25 = RetrieverBM25()
+        if self.index_path and Path(self.index_path).exists():
+            self.bm25.load_index(self.index_path)
+
+    def fit_records(self, records: List[Dict[str, Any]]) -> None:
+        """Fit retriever directly on a list of training trajectory dictionaries."""
+        self.bm25.fit(records)
 
     @staticmethod
-    def tokenize_vi(text: str) -> List[str]:
-        return re.findall(r'\w+', str(text).lower())
+    def _compute_app_overlap(
+        query_apps: Set[str], doc_installed_apps: Set[str], doc_used_apps: Set[str]
+    ) -> float:
+        """Compute compatibility score between sample's installed apps and trajectory's used apps."""
+        if not query_apps:
+            return 0.0
+        # If trajectory used an app that is NOT installed in the current query sample, penalize
+        if doc_used_apps and not doc_used_apps.issubset(query_apps):
+            return 0.0
+        if doc_used_apps and doc_used_apps.issubset(query_apps):
+            return 1.0
+        union = query_apps | doc_installed_apps
+        if not union:
+            return 0.0
+        return len(query_apps & doc_installed_apps) / float(len(union))
 
-    def build_and_save_index(self, train_jsonl_path: str, save_index_path: str = None) -> int:
-        records = []
-        tokenized_docs = []
-        with open(train_jsonl_path, "r", encoding="utf-8") as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                item = json.loads(line)
-                raw_text = item.get("audio_text", "")
-                utterance = raw_text[-1] if isinstance(raw_text, list) and raw_text else str(raw_text)
-                gold_calls = item.get("label", {}).get("tool_calls", [])
-                installed_apps = list(item.get("context", {}).get("installed_apps", {}).keys())
-
-                if utterance:
-                    records.append({
-                        "id": item.get("id"),
-                        "utterance": utterance,
-                        "installed_apps": installed_apps,
-                        "gold_tool_calls": gold_calls
-                    })
-                    tokenized_docs.append(self.tokenize_vi(utterance))
-
-        self.records = records
-        if tokenized_docs:
-            self.bm25 = NativeBM25Okapi(tokenized_docs)
-
-        if save_index_path:
-            Path(save_index_path).parent.mkdir(parents=True, exist_ok=True)
-            with open(save_index_path, "wb") as out:
-                pickle.dump((self.records, self.bm25), out)
-        return len(self.records)
-
-    def load_index(self, index_path: str) -> bool:
-        p = Path(index_path)
-        if p.exists():
-            with open(p, "rb") as f:
-                self.records, self.bm25 = pickle.load(f)
-            return True
-        return False
-
-    def retrieve_top_k(self, utterance_A: str, active_app_ids: List[str]) -> List[Dict[str, Any]]:
-        if not self.bm25 or not self.records:
+    def retrieve(
+        self,
+        utterance: str,
+        installed_apps: List[str],
+        candidate_apps: Optional[List[str]] = None,
+        exclude_sample_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Retrieve top-k in-context POMDP demonstrations without any test label leakage."""
+        if not self.enable_rag or self.top_k <= 0 or not self.bm25.corpus:
             return []
 
-        query_tokens = self.tokenize_vi(utterance_A)
-        base_scores = self.bm25.get_scores(query_tokens)
-        active_set = set(active_app_ids)
+        bm25_scores = self.bm25.score_all(utterance)
+        q_installed = set(installed_apps)
+        q_candidates = set(candidate_apps) if candidate_apps else q_installed
 
-        ranked = []
-        for idx, base_s in enumerate(base_scores):
-            rec = self.records[idx]
-            rec_apps = set(rec.get("installed_apps", []))
-            overlap_count = len(active_set & rec_apps)
-            multiplier = (self.app_overlap_boost ** overlap_count) if overlap_count > 0 else 1.0
-            ranked.append((base_s * multiplier, rec))
+        scored_items: List[tuple[float, int, Dict[str, Any]]] = []
+        for idx, doc in enumerate(self.bm25.corpus):
+            doc_id = str(doc.get("id", ""))
+            if exclude_sample_id and doc_id == exclude_sample_id:
+                continue
 
-        ranked.sort(key=lambda x: x[0], reverse=True)
-        return [r[1] for r in ranked[:self.top_k]]
+            doc_installed = set(doc.get("installed_apps") or [])
+            doc_used = set(doc.get("used_apps") or [])
+
+            app_score = self._compute_app_overlap(q_installed, doc_installed, doc_used)
+            if q_candidates and doc_used and doc_used.issubset(q_candidates):
+                app_score = min(1.0, app_score + 0.25)
+
+            combined = (
+                self.bm25_weight * bm25_scores[idx]
+                + self.app_overlap_weight * app_score
+            )
+            if combined >= self.min_threshold:
+                scored_items.append((combined, idx, doc))
+
+        scored_items.sort(key=lambda x: (-x[0], x[1]))
+        results: List[Dict[str, Any]] = []
+        for score, _, doc in scored_items[: self.top_k]:
+            copied = dict(doc)
+            copied["retrieval_score"] = round(score, 4)
+            results.append(copied)
+        return results

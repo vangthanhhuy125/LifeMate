@@ -1,24 +1,50 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
-name = "lifemate_pomdp_framework"
-version = "2.0.0"
-description = "State-Grounded POMDP & 3-Stage Closed-Loop Research Framework for Spoken Vietnamese Tool-Using Agents"
-authors = [{name = "Vang Thanh Huy"}]
+name = "lifemate-pomdp-agent"
+version = "1.0.0"
+description = "Resource-Constrained State-Grounded POMDP Voice Agent for Zalo AI Challenge 2026"
+readme = "README.md"
 requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "LifeMate Research Team"}
+]
 dependencies = [
-    "torch>=2.1.0",
-    "transformers>=4.40.0",
-    "peft>=0.10.0",
-    "trl>=0.8.0",
-    "datasets>=2.18.0",
-    "accelerate>=0.29.0",
-    "rank_bm25>=0.2.2",
-    "librosa>=0.10.1",
-    "soundfile>=0.12.1",
     "pyyaml>=6.0.1",
-    "pydantic>=2.7.0",
-    "tqdm>=4.66.0"
+    "numpy>=1.24.0",
+    "rank-bm25>=0.2.2",
+    "tqdm>=4.66.0",
 ]
 
-[build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_meta"
+[project.optional-dependencies]
+ml = [
+    "torch>=2.1.0",
+    "torchaudio>=2.1.0",
+    "transformers>=4.40.0",
+    "accelerate>=0.29.0",
+    "peft>=0.10.0",
+    "bitsandbytes>=0.43.0",
+    "datasets>=2.18.0",
+    "soundfile>=0.12.1",
+    "librosa>=0.10.1",
+]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.3.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-v --tb=short"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

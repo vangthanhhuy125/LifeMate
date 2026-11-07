@@ -1,2 +1,4 @@
-experiment:
-  name: 'ablation_no_pruning'
+extends: "configs/default_config.yaml"
+experiment_name: "no_pruning"
+schema_pruning:
+  enable_dynamic_pruning: false

@@ -1,67 +1,142 @@
-import json
-import argparse
-from src.evaluation.official_scorer import OfficialLifeMateScorer
-from src.modules.dynamic_schema_pruner import DynamicSchemaPruner
+"""Evaluation and Ablation Study Runner using the Official Competition Metric."""
 
-def main():
-    parser = argparse.ArgumentParser(description="Evaluate Submission & Generate Research Ablation Metrics")
-    parser.add_argument("--pred", type=str, required=True, help="Đường dẫn file submission.jsonl")
-    parser.add_argument("--gold", type=str, required=True, help="Đường dẫn file jsonl có nhãn chuẩn")
-    parser.add_argument("--catalog", type=str, required=True, help="Đường dẫn file <split>_tools_catalog.json")
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Any, Dict, List
+
+from src.evaluation.official_scorer import OfficialScorer
+from src.pipeline.lifemate_pomdp_pipeline import LifeMatePOMDPPipeline
+from src.utils.reproducibility import load_yaml_config
+
+
+def _get_tool_env_cls(data_root: Path, split_name: str) -> Any:
+    split_path = str((data_root / split_name).resolve())
+    if split_path not in sys.path:
+        sys.path.insert(0, split_path)
+    try:
+        from zaic_tools import ToolEnv  # type: ignore
+
+        return ToolEnv
+    except ImportError:
+        from tests.fakes.fake_env import FakeToolEnv
+
+        return FakeToolEnv
+
+
+def compute_gold_hash_via_replay(
+    tool_env_cls: Any,
+    split_name: str,
+    sample_id: str,
+    data_root: Path,
+    gold_calls: List[Dict[str, Any]],
+) -> str:
+    """Replay gold tool calls in a clean environment instance to obtain the reference `gold_state_hash`."""
+    gold_env = tool_env_cls(split_name, sample_id, root=str(data_root))
+    for tc in gold_calls:
+        if isinstance(tc, dict) and tc.get("name"):
+            gold_env.call(tc["name"], tc.get("arguments") or {})
+    return str(gold_env.get_state_hash())
+
+
+def evaluate_config_on_samples(
+    config_path: str | Path,
+    samples: List[Dict[str, Any]],
+    catalog_data: Dict[str, Any],
+    data_root: Path,
+    split_name: str = "train",
+) -> Dict[str, Any]:
+    """Run a single configuration across evaluation samples and compute official metrics."""
+    cfg = load_yaml_config(config_path)
+    pipeline = LifeMatePOMDPPipeline(cfg, catalog_data=catalog_data)
+    scorer = OfficialScorer.from_catalog(catalog_data)
+    tool_env_cls = _get_tool_env_cls(data_root, split_name)
+
+    predictions: Dict[str, Dict[str, Any]] = {}
+    ground_truths: Dict[str, Dict[str, Any]] = {}
+
+    for item in samples:
+        sid = str(item["id"])
+        label = item.get("label") or {}
+        gold_calls = label.get("tool_calls") or []
+
+        gold_hash = label.get("state_hash")
+        if not gold_hash:
+            gold_hash = compute_gold_hash_via_replay(
+                tool_env_cls, split_name, sid, data_root, gold_calls
+            )
+
+        ground_truths[sid] = {
+            "tool_calls": gold_calls,
+            "state_hash": gold_hash,
+        }
+
+        # Run agent on its single dedicated ToolEnv
+        env = tool_env_cls(split_name, sid, root=str(data_root))
+        sub_rec = pipeline.run_sample(item, env, data_root=data_root, split_name=split_name)
+        predictions[sid] = {
+            "tool_calls": sub_rec.tool_calls,
+            "state_hash": sub_rec.state_hash,
+        }
+
+    metrics = scorer.score_dataset(predictions, ground_truths)
+    return {
+        "config_path": str(config_path),
+        "experiment_name": cfg.get("experiment_name", "default"),
+        "final_score": metrics["final_score"],
+        "tie_breaker_f1": metrics["tie_breaker_f1"],
+        "state_match_rate": metrics["state_match_rate"],
+        "N": metrics["N"],
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Evaluate LifeMate and run ablation experiments.")
+    parser.add_argument("--data-root", type=str, default=".", help="Root directory containing train split.")
+    parser.add_argument("--config", type=str, default="configs/default_config.yaml", help="Main config.")
+    parser.add_argument("--run-ablations", action="store_true", help="Run all ablation configs.")
+    parser.add_argument("--max-samples", type=int, default=100, help="Max validation samples to score.")
     args = parser.parse_args()
 
-    with open(args.catalog, "r", encoding="utf-8") as f:
-        catalog = json.load(f)
-    fuzzy_map = DynamicSchemaPruner.extract_fuzzy_argument_map(catalog)
+    data_root = Path(args.data_root)
+    train_jsonl = data_root / "train" / "train.jsonl"
+    catalog_path = data_root / "train" / "train_tools_catalog.json"
 
-    preds = {}
-    with open(args.pred, "r", encoding="utf-8") as f:
+    if not train_jsonl.exists() or not catalog_path.exists():
+        print(f"[INFO] Train split files not found under {data_root / 'train'}.")
+        return
+
+    with open(catalog_path, "r", encoding="utf-8") as f:
+        catalog_data = json.load(f)
+
+    all_samples: List[Dict[str, Any]] = []
+    with open(train_jsonl, "r", encoding="utf-8") as f:
         for line in f:
             if line.strip():
-                obj = json.loads(line)
-                preds[obj["id"]] = obj
+                all_samples.append(json.loads(line))
 
-    golds = {}
-    with open(args.gold, "r", encoding="utf-8") as f:
-        for line in f:
-            if line.strip():
-                obj = json.loads(line)
-                golds[obj["id"]] = {
-                    "tool_calls": obj.get("label", {}).get("tool_calls", []),
-                    "state_hash": obj.get("label", {}).get("state_hash", "")
-                }
+    eval_samples = all_samples[-args.max_samples :] if len(all_samples) > args.max_samples else all_samples
 
-    N = len(golds)
-    sum_score, sum_tie_f1, sum_P, sum_R, total_U, state_hits = 0.0, 0.0, 0.0, 0.0, 0, 0
+    configs_to_run = [Path(args.config)]
+    if args.run_ablations:
+        ablation_dir = Path("configs/ablations")
+        if ablation_dir.exists():
+            configs_to_run.extend(sorted(ablation_dir.glob("*.yaml")))
 
-    for sid, g_item in golds.items():
-        p_item = preds.get(sid, {"tool_calls": [], "state_hash": ""})
-        res = OfficialLifeMateScorer.score_instance(
-            sys_calls=p_item.get("tool_calls", []),
-            gold_calls=g_item["tool_calls"],
-            sys_hash=p_item.get("state_hash", ""),
-            gold_hash=g_item["state_hash"],
-            fuzzy_map=fuzzy_map,
-            ignore_hash=False
+    results = []
+    for cfg_path in configs_to_run:
+        res = evaluate_config_on_samples(
+            config_path=cfg_path,
+            samples=eval_samples,
+            catalog_data=catalog_data,
+            data_root=data_root,
+            split_name="train",
         )
-        sum_score += res["score"]
-        sum_tie_f1 += res["f1_unconstrained"]
-        sum_P += res["P"]
-        sum_R += res["R"]
-        total_U += res["U"]
-        if res["state_matched"]:
-            state_hits += 1
+        results.append(res)
 
-    print("==================================================================")
-    print(f"BÁO CÁO KẾT QUẢ THỰC NGHIỆM KHOA HỌC (N = {N} samples)")
-    print("------------------------------------------------------------------")
-    print(f"1. Final Official Score (100/N * Sum) : {(100.0 / N) * sum_score:.2f}")
-    print(f"2. Final State Hash Match Rate (%)    : {(100.0 / N) * state_hits:.2f}%")
-    print(f"3. Tie-Breaking Tool Call F1 (%)      : {(100.0 / N) * sum_tie_f1:.2f}")
-    print(f"4. Macro Tool Precision P = M/(M+U)   : {(100.0 / N) * sum_P:.2f}%")
-    print(f"5. Macro Tool Recall R = M/|G|        : {(100.0 / N) * sum_R:.2f}%")
-    print(f"6. Total Unmatched/Rejected Calls (U) : {total_U}")
-    print("==================================================================")
+    print(json.dumps(results, ensure_ascii=False, indent=2))
+
 
 if __name__ == "__main__":
     main()

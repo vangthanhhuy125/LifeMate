@@ -1,2 +1,4 @@
-experiment:
-  name: 'ablation_no_constrained_decoding'
+extends: "configs/default_config.yaml"
+experiment_name: "no_constrained_decoding"
+pomdp_planner:
+  enable_constrained_decoding: false

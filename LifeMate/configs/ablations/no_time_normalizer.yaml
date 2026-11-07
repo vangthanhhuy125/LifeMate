@@ -1,2 +1,5 @@
-experiment:
-  name: 'ablation_no_time_normalizer'
+extends: "configs/default_config.yaml"
+experiment_name: "no_time_normalizer"
+nlu:
+  enable_time_normalizer: false
+  enable_number_normalizer: false

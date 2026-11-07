@@ -1,2 +1,10 @@
-experiment:
-  name: 'ablation_zero_shot_llm'
+extends: "configs/default_config.yaml"
+experiment_name: "zero_shot_llm"
+retrieval:
+  enable_rag: false
+  top_k: 0
+schema_pruning:
+  enable_dynamic_pruning: false
+execution:
+  enable_validate_guard: false
+  enable_xref_guard: false

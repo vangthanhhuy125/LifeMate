@@ -1,2 +1,4 @@
-experiment:
-  name: 'ablation_no_validate'
+extends: "configs/default_config.yaml"
+experiment_name: "no_validate"
+execution:
+  enable_validate_guard: false
